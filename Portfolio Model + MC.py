@@ -27,8 +27,8 @@ benchmarks = benchmarks.split(',')
 # Download data for multiple assets
 try:
     data = yf.download(tickers, period="10y")['Adj Close']
-    if data.isnull().values.any():
-        raise ValueError("Downloaded data contains missing values. Please check the data or use different tickers.")
+    data.dropna(axis=1, how='all', inplace=True)  # Drop tickers with no valid data
+    data.fillna(method='ffill', inplace=True)  # Fill missing data with forward fill
 except Exception as e:
     print(f"Error downloading data: {e}")
     exit()
@@ -43,7 +43,7 @@ def fit_garch(ticker):
     return garch_fit.conditional_volatility / 100
 
 # Get GARCH volatility estimates in parallel
-garch_vols = Parallel(n_jobs=-1)(delayed(fit_garch)(ticker) for ticker in tickers)
+garch_vols = Parallel(n_jobs=4)(delayed(fit_garch)(ticker) for ticker in tickers)
 volatility_df = pd.concat(garch_vols, axis=1)
 volatility_df.columns = tickers
 cov_matrix_garch = volatility_df.cov() * ANNUALIZATION_FACTOR
@@ -103,26 +103,26 @@ print(f"Sharpe Ratio: {opt_sharpe:.2f}")
 
 # Monte Carlo simulation function
 def monte_carlo_simulation(weights, mean_returns, cov_matrix, mc_sims, T, initial_value):
-    df = 5  # Degrees of freedom for Student's t distribution
+    df = 10  # Adjusted degrees of freedom for Student's t distribution
     n_assets = len(mean_returns)
-
+    
     # Generate random samples for each asset
-    standard_t_samples = t.rvs(df, size=(T, mc_sims, n_assets))  # Shape (T, mc_sims, n_assets)
+    standard_t_samples = t.rvs(df, size=(T * ANNUALIZATION_FACTOR, mc_sims, n_assets))  # Adjusted shape for daily simulations
     
     # Expand mean returns and volatility for broadcasting
     mean_returns = mean_returns.values[np.newaxis, np.newaxis, :]  # Shape (1, 1, n_assets)
-    volatility = np.sqrt(np.diag(cov_matrix * ANNUALIZATION_FACTOR))[np.newaxis, np.newaxis, :] # Shape (1, 1, n_assets)
+    volatility = np.sqrt(np.diag(cov_matrix))[np.newaxis, np.newaxis, :]  # Removed annualization factor to avoid overestimation
 
     # Simulated returns for each asset
-    simulated_returns = mean_returns * ANNUALIZATION_FACTOR + standard_t_samples * volatility  # Shape (T, mc_sims, n_assets)
+    simulated_returns = mean_returns * (1 / ANNUALIZATION_FACTOR) + standard_t_samples * volatility  # Daily returns
     
     # Portfolio log returns
-    portfolio_returns = np.dot(simulated_returns, weights)  # Shape (T, mc_sims)
+    portfolio_returns = np.dot(simulated_returns, weights)  # Shape (T * ANNUALIZATION_FACTOR, mc_sims)
     log_returns = np.log1p(portfolio_returns)
     
-    # Cumulative log returns and portfolio valu
+    # Cumulative log returns and portfolio value
     cumulative_log_returns = np.cumsum(log_returns, axis=0)
-    cumulative_log_returns = np.clip(cumulative_log_returns, a_min=None, a_max=700)  # Clipping to prevent overflow
+    cumulative_log_returns = np.clip(cumulative_log_returns, a_min=None, a_max=10)  # Tightened clipping to avoid overflow
     sim_results = initial_value * np.exp(cumulative_log_returns)
 
     return sim_results
@@ -133,7 +133,7 @@ def monte_carlo_simulation(weights, mean_returns, cov_matrix, mc_sims, T, initia
 # CVaR (Conditional Value at Risk) represents the expected loss in the worst-case scenarios beyond the VaR threshold (aka all the scenarios belonging to the worst 10%).
 final_portfolio_values = monte_carlo_simulation(optimized_weights, mean_returns, cov_matrix, mc_sims, T, initial_portfolio_value)
 mean_final_value = np.mean(final_portfolio_values[-1, :])
-var_90 = np.percentile(final_portfolio_values[-1, :], 10) # 10th percentile representing the worst 10% VaR scenarios
+var_90 = np.percentile(final_portfolio_values[-1, :], 10)  # 10th percentile representing the worst 10% VaR scenarios
 cvar_90 = np.mean(final_portfolio_values[-1, :][final_portfolio_values[-1, :] <= var_90])
 
 print("\n--- Monte Carlo Simulation Results ---")
@@ -152,22 +152,11 @@ max_dd = max_drawdown(final_portfolio_values[-1, :])
 print("\n--- Risk Metrics ---")
 print(f"Maximum Drawdown: {max_dd:.2%}")
 
-# GARCH model for time-varying volatility
-# Parallelize GARCH fitting for multiple tickers
-def fit_garch(ticker):
-    model = arch_model(returns[ticker] * 100, vol='Garch', p=1, q=1)
-    garch_fit = model.fit(disp='off')
-    return f"{ticker} GARCH(1,1) Model Summary:\n{garch_fit.summary()}\n"
-
-results = Parallel(n_jobs=-1)(delayed(fit_garch)(ticker) for ticker in tickers)
-for result in results:
-    print(result)
-
 # Enhanced Monte Carlo Simulation Chart
 import matplotlib.table as tbl
 fig, ax = plt.subplots(figsize=(12, 7))
 for i in range(min(mc_sims, 100)):  # Plot a subset for clarity
-    ax.plot(np.arange(1, T + 1), final_portfolio_values[:, i], color='lightblue', alpha=0.1)
+    ax.plot(np.arange(1, T * ANNUALIZATION_FACTOR + 1), final_portfolio_values[:, i], color='lightblue', alpha=0.1)
 
 # Calculate key statistics for Monte Carlo results
 best_result = np.max(final_portfolio_values[-1, :])
@@ -181,11 +170,20 @@ def plot_key_trajectory(ax, x_values, y_values, color, label, linestyle='-', lin
     ax.plot(x_values, y_values, color=color, linestyle=linestyle, linewidth=linewidth, label=label)
 
 # Plot key lines with distinct styles
-plot_key_trajectory(ax, np.arange(1, T + 1), np.full(T, best_result), color='green', label=f'Best Result: ${best_result:,.2f}')
-plot_key_trajectory(ax, np.arange(1, T + 1), np.full(T, worst_result), color='red', label=f'Worst Result: ${worst_result:,.2f}')
-plot_key_trajectory(ax, np.arange(1, T + 1), np.full(T, median_result), color='purple', label=f'Median Result: ${median_result:,.2f}', linestyle='--')
-plot_key_trajectory(ax, np.arange(1, T + 1), np.full(T, mean_result), color='blue', label=f'Mean Result: ${mean_result:,.2f}', linestyle='--')
-plot_key_trajectory(ax, np.arange(1, T + 1), np.full(T, mode_result), color='orange', label=f'Mode Result: ${mode_result:,.2f}', linestyle='-.')
+plot_key_trajectory(ax, np.arange(1, T * ANNUALIZATION_FACTOR + 1), np.full(T * ANNUALIZATION_FACTOR, best_result), color='green', label=f'Best Result: ${best_result:,.2f}')
+plot_key_trajectory(ax, np.arange(1, T * ANNUALIZATION_FACTOR + 1), np.full(T * ANNUALIZATION_FACTOR, worst_result), color='red', label=f'Worst Result: ${worst_result:,.2f}')
+plot_key_trajectory(ax, np.arange(1, T * ANNUALIZATION_FACTOR + 1), np.full(T * ANNUALIZATION_FACTOR, median_result), color='purple', label=f'Median Result: ${median_result:,.2f}', linestyle='--')
+plot_key_trajectory(ax, np.arange(1, T * ANNUALIZATION_FACTOR + 1), np.full(T * ANNUALIZATION_FACTOR, mean_result), color='blue', label=f'Mean Result: ${mean_result:,.2f}', linestyle='--')
+plot_key_trajectory(ax, np.arange(1, T * ANNUALIZATION_FACTOR + 1), np.full(T * ANNUALIZATION_FACTOR, mode_result), color='orange', label=f'Mode Result: ${mode_result:,.2f}', linestyle='-.')
+
+plt.xlabel('Days', fontsize=9)
+plt.ylabel('Portfolio Value', fontsize=9)
+plt.title('Monte Carlo Simulation of Portfolio Growth (Daily)', fontsize=10)
+plt.legend(loc='best', fontsize=8)  # Ensure legend does not overlap the table
+plt.grid(alpha=0.3)  # Lighter grid lines for less visual clutter
+plt.tight_layout()  # Adjust layout to ensure proper spacing
+plt.show()
+
 
 # Highlight best, worst, median, mode, and mean trajectories
 best_trajectory = final_portfolio_values[:, np.argmax(final_portfolio_values[-1, :])]
@@ -226,21 +224,13 @@ for key, cell in table.get_celld().items():
     cell.set_alpha(0.8)  # Add transparency to make it lighter
     cell.set_edgecolor('lightgrey')  # Subtle border for better visibility
 
-# Add chart details
-plt.xlabel('Years', fontsize=9)
-plt.ylabel('Portfolio Value', fontsize=9)
-plt.title('Portfolio Value Over Time', fontsize=10)
-plt.legend(loc='best', fontsize=8)  # Ensure legend does not overlap the table
-plt.grid(alpha=0.3)  # Lighter grid lines for less visual clutter
-plt.tight_layout()  # Adjust layout to ensure proper spacing
-plt.show()
-
-# Interactive Visualization with Plotly
+# Monte Carlo Simulation with Plotly
 fig = go.Figure()
-for i in range(min(mc_sims, 100)):  # Limit the number of trajectories displayed
+num_trajectories = min(mc_sims, 100)  # Add parameter to control the number of trajectories displayed
+for i in range(num_trajectories):
     fig.add_trace(go.Scatter(
-        x=np.arange(1, T + 1),
-        y=final_portfolio_values[:, i],
+        x=np.linspace(1, T * ANNUALIZATION_FACTOR, num=500),  # Downsample to 500 points for efficiency
+        y=np.interp(np.linspace(1, T * ANNUALIZATION_FACTOR, num=500), np.arange(1, T * ANNUALIZATION_FACTOR + 1), final_portfolio_values[:, i]),
         mode='lines',
         line=dict(color='lightblue', width=0.5),
         showlegend=False
@@ -248,112 +238,114 @@ for i in range(min(mc_sims, 100)):  # Limit the number of trajectories displayed
 
 # Add key metrics as separate lines
 fig.add_trace(go.Scatter(
-    x=np.arange(1, T + 1),
-    y=np.full(T, mean_final_value),
+    x=np.linspace(1, T * ANNUALIZATION_FACTOR, num=500),
+    y=np.full(500, mean_final_value),
     mode='lines',
     name='Mean Final Value',
     line=dict(color='blue', dash='dash')
 ))
 fig.add_trace(go.Scatter(
-    x=np.arange(1, T + 1),
-    y=np.full(T, var_90),
+    x=np.linspace(1, T * ANNUALIZATION_FACTOR, num=500),
+    y=np.full(500, var_90),
     mode='lines',
     name='10% Value at Risk',
     line=dict(color='red', dash='dash')
 ))
 fig.add_trace(go.Scatter(
-    x=np.arange(1, T + 1),
-    y=np.full(T, cvar_90),
+    x=np.linspace(1, T * ANNUALIZATION_FACTOR, num=500),
+    y=np.full(500, cvar_90),
     mode='lines',
     name='10% Conditional VaR',
     line=dict(color='orange', dash='dash')
 ))
 
 fig.update_layout(
-    title='Monte Carlo Simulation: Portfolio Growth',
-    xaxis_title='Years',
+    title='Monte Carlo Simulation: Portfolio Growth (Daily)',
+    xaxis_title='Days',
     yaxis_title='Portfolio Value',
     template='plotly_white',
     legend=dict(x=0.02, y=0.98)
 )
-fig.show()
 
-# Setting up Dash app for interactive visualization
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
-
-app.layout = dbc.Container([
-    dbc.Row(dbc.Col(html.H1("Portfolio Optimization Dashboard", className="text-center mt-4"))),
-    dbc.Row([
-        dbc.Col(dcc.Graph(
-            figure={
-                'data': [
-                    go.Histogram(
-                        x=final_portfolio_values[-1, :],
-                        nbinsx=50,
-                        marker_color='skyblue',
-                        name='Final Portfolio Values'
-                    ),
-                    go.Scatter(
-                        x=[var_90],
-                        y=[0],
-                        mode='lines',
-                        line=dict(color='red', dash='dash'),
-                        name=f'10% VaR: ${var_90:.2f}'
+def create_dash_app():
+    app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+    app.layout = dbc.Container([
+        dbc.Row(dbc.Col(html.H1("Portfolio Optimization Dashboard", className="text-center mt-4"))),
+        dbc.Row([
+            dbc.Col(dcc.Graph(
+                figure={
+                    'data': [
+                        go.Histogram(
+                            x=final_portfolio_values[-1, :],
+                            nbinsx=50,
+                            marker_color='skyblue',
+                            name='Final Portfolio Values'
+                        ),
+                        go.Scatter(
+                            x=[var_90],
+                            y=[0],
+                            mode='lines',
+                            line=dict(color='red', dash='dash'),
+                            name=f'10% VaR: ${var_90:.2f}'
+                        )
+                    ],
+                    'layout': go.Layout(
+                        title='Distribution of Final Portfolio Values',
+                        yaxis=dict(
+                            title='Frequency',
+                            tickformat=',.0f'
+                        ),
+                        xaxis=dict(
+                            title='Portfolio Value',
+                            tickformat='$,.0f'
+                        ),
+                        showlegend=True
                     )
-                ],
-                'layout': go.Layout(
-                    title='Distribution of Final Portfolio Values',
-                      yaxis=dict(
-                        title='Portfolio Value',
-                        tickformat='$,.0f',  # Format as currency
-                        tickvals=np.arange(min(final_portfolio_values[-1, :]),
-                                           max(final_portfolio_values[-1, :]), 
-                                           1000000)  # Ticks every 1M
-                    ),
-                    xaxis=dict(
-                        title='Frequency',
-                        tickmode='auto',  # Automatically determine tick intervals
-                    ),
-                    showlegend=True,
-                    gridcolor='lightgray'  # Light gridlines for readability
-                )
-            }
-        ), width=12)
-    ]),
-    
-    # Line Chart of Portfolio Growth
-    dbc.Row([
-        dbc.Col(dcc.Graph(
-            figure={
-                'data': [
-                    go.Scatter(
-                        x=np.arange(1, T + 1),
-                        y=np.mean(final_portfolio_values, axis=1),
-                        mode='lines',
-                        name='Optimized Portfolio'
+                }
+            ), width=12)
+        ]),
+        # Line Chart of Portfolio Growth
+        dbc.Row([
+            dbc.Col(dcc.Graph(
+                figure={
+                    'data': [
+                        go.Scatter(
+                            x=np.linspace(1, T * ANNUALIZATION_FACTOR, num=500),
+                            y=np.interp(np.linspace(1, T * ANNUALIZATION_FACTOR, num=500), np.arange(1, T * ANNUALIZATION_FACTOR + 1), np.mean(final_portfolio_values, axis=1)),
+                            mode='lines',
+                            name='Optimized Portfolio'
+                        )
+                    ],
+                    'layout': go.Layout(
+                        title=f'{T}-Year Optimized Portfolio Growth (Daily)',
+                        xaxis=dict(
+                            title='Days',
+                            tickvals=np.linspace(0, T * ANNUALIZATION_FACTOR, num=10),
+                            tickmode='array'
+                        ),
+                        yaxis=dict(
+                            title='Portfolio Value',
+                            tickformat='$,.0f',
+                            gridcolor='lightgray'
+                        ),
+                        showlegend=True
                     )
-                ],
-                'layout': go.Layout(
-                    title=f'{T}-Year Optimized Portfolio Growth',
-                    xaxis=dict(
-                        title='Years',
-                        tickvals=np.arange(0, T + 1, 3),  # Ticks every 3 years
-                        tickmode='array'  # Explicit tick values
-                    ),
-                    yaxis=dict(
-                        title='Portfolio Value',
-                        tickformat='$,.0f',  # Format as currency
-                        gridcolor='lightgray',
-                        gridwidth=0.5  # Thin gridlines
-                    ),
-                    showlegend=True
-                )
-            }
-        ), width=12)
+                }
+            ), width=12)
+        ]),
+        # Add Monte Carlo Simulation as part of the Dash layout
+        dbc.Row([
+            dbc.Col(dcc.Graph(
+                figure=fig
+            ), width=12)
+        ])
     ])
-])
+
+    return app
 
 if __name__ == '__main__':
+    app = create_dash_app()
+    app.run(debug=True)
     # Configuration Section for modifying parameters
     print("\n--- Configuration Section ---")
     initial_portfolio_value = float(input("Modify initial portfolio value (current: 10000): ") or initial_portfolio_value)
@@ -365,4 +357,4 @@ if __name__ == '__main__':
     benchmarks = input("Modify benchmark tickers (current: 'SPY'): ") or ','.join(benchmarks)
     benchmarks = benchmarks.split(',')
     
-    app.run_server(debug=True)
+
