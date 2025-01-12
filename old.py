@@ -1,4 +1,4 @@
-import y finance as yf
+import yfinance as yf
 
 #Prompting user for the share name
 STK = input("Enter share name: ")
